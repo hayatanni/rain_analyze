@@ -1,0 +1,40 @@
+import matplotlib.pyplot as plt
+
+def plot_water_and_voltage(df, device_id=None):
+    """
+    df: analyze_device_messages で得られた DataFrame
+        必須列: 'Timestamp_JST', 'Distance_mm', 'Voltage_V'
+    device_id: グラフタイトルに付ける任意のデバイスID
+    """
+
+    title_suffix = f" (Device {device_id})" if device_id is not None else ""
+
+    # 水位（距離）グラフ
+    plt.figure(figsize=(10, 4))
+    plt.plot(df["Timestamp_JST"], df["Distance_mm"])
+    plt.xlabel("Timestamp (JST)")
+    plt.ylabel("Distance_mm [mm]  ※小さいほど水位が高い")
+    plt.title("Water level (Distance_mm) vs Time" + title_suffix)
+    plt.grid(True)
+    plt.tight_layout()
+
+    # 電圧グラフ
+    plt.figure(figsize=(10, 4))
+    plt.plot(df["Timestamp_JST"], df["Voltage_V"])
+    plt.xlabel("Timestamp (JST)")
+    plt.ylabel("Voltage_V [V]")
+    plt.title("Battery voltage vs Time" + title_suffix)
+    plt.grid(True)
+    plt.tight_layout()
+
+    # 対話環境では show() を呼ぶ
+    plt.show()
+
+# 使い方例
+if __name__ == "__main__":
+    from batt&rain_analyze import analyze_device_messages  # 実際のモジュール名に合わせて修正
+
+    csv_path = "export-device-1F06AD2-messages (1).csv"
+    df_raw, summary, abnormal_h = analyze_device_messages(csv_path)
+
+    plot_water_and_voltage(df_raw, device_id=summary.get("device_id"))
