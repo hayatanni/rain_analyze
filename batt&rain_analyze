@@ -1,0 +1,202 @@
+import csv
+import re
+from datetime import timedelta
+
+import numpy as np
+import pandas as pd
+
+# 水位変化の絶対値しきい値 [mm]
+ABS_DH_THRESHOLD_MM = 100.0
+
+
+def load_messages_csv(path: str) -> pd.DataFrame:
+    """
+    特殊な引用付き CSV を安全に DataFrame に変換する。
+
+    例:
+    "\ufeff"Data;""Device ID"";""Sequence number"";""Timestamp"""
+    "cd64...;""01F06AD2"";""4082"";""2025-11-30 23:58:18"""
+    """
+
+    clean_lines = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            # 行全体を囲んでいる外側の " を除去
+            if line.startswith('"') and line.endswith('"'):
+                line = line[1:-1]
+            clean_lines.append(line)
+
+    reader = csv.reader(clean_lines, delimiter=";", quotechar='"')
+    rows = [[cell.strip('"') for cell in row] for row in reader]
+
+    # ヘッダ整形（BOM, 余計な " を除去）
+    header = [h.replace("\ufeff", "").replace('"', "").strip() for h in rows[0]]
+    df = pd.DataFrame(rows[1:], columns=header)
+    return df
+
+
+def decode_hex(hex_str: str):
+    """
+    Data フィールドの先頭 6byte (12桁 HEX) から
+    距離[mm], 温度[℃], 電圧[V] を復号する。
+    """
+    try:
+        s = re.sub(r"[^0-9a-fA-F]", "", str(hex_str))
+        if len(s) < 12:
+            return np.nan, np.nan, np.nan
+
+        dist = int(s[0:4], 16) / 100.0    # mm
+        temp = int(s[4:8], 16) / 100.0    # ℃
+        volt = int(s[8:12], 16) / 250.0   # V
+        return dist, temp, volt
+    except Exception:
+        return np.nan, np.nan, np.nan
+
+
+def find_col(df: pd.DataFrame, name_part: str) -> str | None:
+    """部分一致で列名を探す（例: 'data', 'device', 'sequence', 'time'）"""
+    for c in df.columns:
+        if name_part in c.lower():
+            return c
+    return None
+
+
+def analyze_device_messages(path: str):
+    """Sigfox CSV を読み込み、欠測・電圧・水位の異常をまとめて評価する。"""
+    df = load_messages_csv(path)
+
+    # 列名正規化
+    df.columns = [c.strip().replace('"', '').replace("'", "") for c in df.columns]
+
+    col_data = find_col(df, "data")
+    col_id = find_col(df, "device")
+    col_seq = find_col(df, "sequence")
+    col_time = find_col(df, "time") or find_col(df, "timestamp")
+
+    if not all([col_data, col_id, col_seq, col_time]):
+        raise ValueError(f"列名を特定できません: {df.columns.tolist()}")
+
+    # 型変換
+    df[col_time] = pd.to_datetime(df[col_time], errors="coerce", utc=True)
+    df[col_seq] = pd.to_numeric(df[col_seq], errors="coerce", downcast="integer")
+
+    # 時刻が取れない行を除外し、時間順にソート
+    df = df.dropna(subset=[col_time]).sort_values(col_time).reset_index(drop=True)
+
+    # ログが UTC と仮定して JST に変換
+    df["Timestamp_JST"] = df[col_time] + timedelta(hours=9)
+
+    # 送信間隔 [分]
+    df["Δt_min"] = df[col_time].diff().dt.total_seconds() / 60.0
+
+    # HEX デコード
+    decoded = df[col_data].apply(decode_hex)
+    df[["Distance_mm", "Temperature_C", "Voltage_V"]] = pd.DataFrame(
+        decoded.tolist(), index=df.index
+    )
+
+    # ========= 欠測解析 =========
+    mean_dt = df["Δt_min"].mean()            # 平均送信間隔 [分]
+    max_dt = df["Δt_min"].max()              # 最大送信間隔 [分]
+    missing_count = int((df["Δt_min"] > 11).sum())
+    # 欠測率[%] = 欠測回数 / 全レコード数 * 100
+    missing_rate_pct = missing_count / len(df) * 100.0 if len(df) > 0 else 0.0
+
+    # ========= 電圧解析 =========
+    min_v = float(df["Voltage_V"].min())
+    mean_v = float(df["Voltage_V"].mean())
+    last_v = float(df["Voltage_V"].iloc[-1])
+    min_v_time_jst = df.loc[df["Voltage_V"].idxmin(), "Timestamp_JST"]
+
+    # ========= 水位変化解析 =========
+    # 距離減少（センサーが近づく）＝水位上昇とみなして符号反転
+    df["Δh_mm"] = df["Distance_mm"].diff() * -1.0
+
+    max_dh = float(df["Δh_mm"].max())
+    min_dh = float(df["Δh_mm"].min())
+    med_dh = float(df["Δh_mm"].median())
+    q75 = df["Δh_mm"].quantile(0.75)
+    q25 = df["Δh_mm"].quantile(0.25)
+    iqr_dh = float(q75 - q25)
+
+    # IQR が 0 の場合は絶対値しきい値で判定
+    if np.isnan(iqr_dh) or iqr_dh == 0.0:
+        dh_upper = ABS_DH_THRESHOLD_MM
+        dh_lower = -ABS_DH_THRESHOLD_MM
+    else:
+        dh_upper = med_dh + 3.0 * iqr_dh
+        dh_lower = med_dh - 3.0 * iqr_dh
+
+    abnormal_h = df[(df["Δh_mm"] > dh_upper) | (df["Δh_mm"] < dh_lower)]
+    abnormal_h_count = int(len(abnormal_h))
+
+    # ========= 総合判定 =========
+    if (min_v < 3.0) or ((df["Δt_min"] >= 60).sum() > 1):
+        severity = "深刻"
+        priority = "即対応"
+        abnormal_flag = "異常あり"
+    elif (3.0 <= min_v < 3.5) or (missing_rate_pct > 5.0) or (abnormal_h_count > 3):
+        severity = "高"
+        priority = "要対応"
+        abnormal_flag = "異常あり"
+    elif abnormal_h_count > 0:
+        severity = "中"
+        priority = "経過観察"
+        abnormal_flag = "異常あり"
+    else:
+        severity = "低"
+        priority = "経過観察"
+        abnormal_flag = "異常なし"
+
+    if min_v < 3.5:
+        main_issue_category = "電池低下型"
+    elif missing_count > 0:
+        main_issue_category = "通信欠測型"
+    else:
+        main_issue_category = "特段の異常なし"
+
+    summary = {
+        "device_id": df[col_id].iloc[0],
+        "data_start_utc": df[col_time].min(),
+        "data_end_utc": df[col_time].max(),
+        "records": int(len(df)),
+        "mean_interval_min": float(mean_dt),
+        "max_interval_min": float(max_dt),
+        "missing_count": missing_count,
+        "missing_rate_pct": float(missing_rate_pct),
+        "min_voltage_v": min_v,
+        "mean_voltage_v": mean_v,
+        "last_voltage_v": last_v,
+        "min_voltage_time_jst": min_v_time_jst.strftime("%Y-%m-%d %H:%M JST"),
+        "max_dh_mm": max_dh,
+        "min_dh_mm": min_dh,
+        "median_dh_mm": med_dh,
+        "iqr_dh_mm": iqr_dh,
+        "dh_upper_th_mm": float(dh_upper),
+        "dh_lower_th_mm": float(dh_lower),
+        "abnormal_dh_count": abnormal_h_count,
+        "overall_abnormal": abnormal_flag,
+        "overall_severity": severity,
+        "main_issue_category": main_issue_category,
+        "followup_priority": priority,
+    }
+
+    return df, summary, abnormal_h
+
+
+if __name__ == "__main__":
+    # 解析したい CSV ファイルパス
+    csv_path = "export-device-1F06AD2-messages (1).csv"
+
+    df_raw, summary, abnormal_h = analyze_device_messages(csv_path)
+    summary_df = pd.DataFrame([summary])
+
+    # ACE 環境等で DataFrame を表示する場合は、ここを環境に合わせて書き換える
+    # 例:
+    # import ace_tools as tools
+    # tools.display_dataframe_to_user("Sigfox自動分析結果", summary_df)
+
+    print(summary_df.to_string(index=False))
