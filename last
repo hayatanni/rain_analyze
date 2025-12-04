@@ -1,0 +1,195 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import re
+import numpy as np
+
+# 解析対象のCSVファイル
+TARGET_CSV = 'export-device-2200EEC-messages.csv'
+
+# ==========================================
+# 1. データ読み込み & パース
+# ==========================================
+def load_sigfox_csv(filepath):
+    parsed_data = []
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                
+                parts = line.split(';')
+                clean_parts = [p.strip().replace('"', '').replace("'", "") for p in parts]
+                
+                if len(clean_parts) >= 4:
+                    if "Data" in clean_parts[0] and "Timestamp" in clean_parts[-1]:
+                        continue
+                    
+                    data_val = next((x for x in clean_parts if len(x) >= 12 and re.match(r'^[0-9a-fA-F]+$', x)), None)
+                    time_val = next((x for x in clean_parts if re.search(r'\d{4}-\d{2}-\d{2}', x)), None)
+                    device_id = clean_parts[1] if len(clean_parts) > 1 else "Unknown"
+
+                    if data_val and time_val:
+                        parsed_data.append([data_val, device_id, time_val])
+                        
+        return pd.DataFrame(parsed_data, columns=['Data', 'DeviceID', 'Timestamp'])
+    except Exception as e:
+        print(f"Load Error: {e}")
+        return pd.DataFrame()
+
+# ==========================================
+# 2. データ展開ロジック (1行 -> 5点時系列)
+# ==========================================
+def decode_payload_expanded(row):
+    hex_str = str(row['Data'])
+    try:
+        base_time = row['Timestamp']
+    except:
+        return []
+        
+    try:
+        s = re.sub(r"[^0-9a-fA-F]", "", hex_str)
+        if len(s) < 24: return []
+
+        # Byte 0: 電圧係数 -> 電圧(V)
+        volt_index = int(s[0:2], 16)
+        voltage_v = (volt_index * 0.0125) + 1.0
+        
+        # Byte 1: 電池残量
+        batt_pct = int(s[2:4], 16)
+        
+        points = []
+        for i in range(5):
+            start = 4 + (i * 4)
+            end = start + 4
+            dist_val = int(s[start:end], 16)
+            
+            t_offset = base_time - pd.Timedelta(minutes=i*2)
+            
+            points.append({
+                'Timestamp_JST': t_offset,
+                'Distance_mm': dist_val,
+                'Voltage_V': voltage_v,
+                'Battery_Pct': batt_pct,
+                'DeviceID': row['DeviceID']
+            })
+        return points
+    except:
+        return []
+
+# ==========================================
+# メイン処理
+# ==========================================
+def main():
+    # 1. 読み込み
+    df_raw = load_sigfox_csv(TARGET_CSV)
+    if df_raw.empty:
+        print("Data load failed.")
+        return
+
+    # 2. 時刻変換
+    df_raw['Timestamp'] = pd.to_datetime(df_raw['Timestamp'], errors='coerce', utc=True)
+    df_raw = df_raw.dropna(subset=['Timestamp']).sort_values('Timestamp').reset_index(drop=True)
+    df_raw['Timestamp'] = df_raw['Timestamp'].dt.tz_convert('Asia/Tokyo')
+
+    # 通信品質評価
+    df_raw['Time_Diff'] = df_raw['Timestamp'].diff().dt.total_seconds() / 60.0
+    missing_count = (df_raw['Time_Diff'] > 11).sum()
+    long_gap_count = (df_raw['Time_Diff'] >= 60).sum()
+    max_dt = df_raw['Time_Diff'].max()
+    if pd.isna(max_dt): max_dt = 0.0
+    total_samples = len(df_raw)
+
+    # 3. データ展開
+    all_points = []
+    for _, row in df_raw.iterrows():
+        all_points.extend(decode_payload_expanded(row))
+
+    df_expanded = pd.DataFrame(all_points)
+    df_expanded = df_expanded.sort_values('Timestamp_JST').reset_index(drop=True)
+    device_id = df_expanded['DeviceID'].iloc[0]
+
+    # 数値評価
+    min_voltage = df_expanded['Voltage_V'].min()
+    mean_voltage = df_expanded['Voltage_V'].mean()
+    
+    # 水位変動チェック
+    df_expanded['Delta_H'] = -df_expanded['Distance_mm'].diff()
+    abnormal_dh_count = ((df_expanded['Delta_H'] > 20) | (df_expanded['Delta_H'] < -20)).sum()
+
+    # 判定ロジック
+    severity = "低"
+    category = "特段の異常なし"
+    followup = "経過観察"
+    abnormal_flag = "異常なし"
+
+    if min_voltage < 3.0:
+        severity = "深刻"; category = "電池低下型"; followup = "即対応"; abnormal_flag = "異常あり"
+    elif long_gap_count >= 1:
+        severity = "深刻"; category = "通信障害深刻"; followup = "即対応"; abnormal_flag = "異常あり"
+    elif min_voltage < 3.5:
+        severity = "高"; category = "電池低下型"; followup = "要対応"; abnormal_flag = "異常あり"
+    elif missing_count > (total_samples * 0.05) or missing_count > 10:
+        severity = "高"; category = "通信欠測型"; followup = "要対応"; abnormal_flag = "異常あり"
+    elif abnormal_dh_count > 5:
+        severity = "中"; category = "水位センサー異常候補"; followup = "要対応"; abnormal_flag = "異常あり"
+
+    # グラフ描画
+    plt.style.use('bmh')
+    plt.rcParams['font.family'] = 'sans-serif'
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True, gridspec_kw={'height_ratios': [2, 1]})
+    plt.subplots_adjust(hspace=0.15)
+
+    # 水位
+    ax1.plot(df_expanded['Timestamp_JST'], df_expanded['Distance_mm'], color='#0072B2', marker='.', markersize=2, linestyle='-', linewidth=1)
+    ax1.set_ylabel('Distance [mm]\n(Lower value = Higher Water)')
+    ax1.set_title(f'Water Level [Device: {device_id}]', fontweight='bold')
+    ax1.invert_yaxis()
+    ax1.grid(True)
+
+    # 電圧
+    ax2.plot(df_expanded['Timestamp_JST'], df_expanded['Voltage_V'], color='#D55E00', marker='', linestyle='-', linewidth=1.5)
+    ax2.set_ylabel('Voltage [V]')
+    ax2.set_title('Battery Voltage')
+    ax2.grid(True)
+    ax2.set_ylim(min_voltage - 0.1, df_expanded['Voltage_V'].max() + 0.1)
+    
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d %H:%M'))
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+    # ログ出力
+    log_row = [
+        pd.Timestamp.now().strftime("%Y-%m-%d %H:%M JST"),
+        device_id, "",
+        df_expanded['Timestamp_JST'].min().strftime("%Y-%m-%d %H:%M JST"),
+        df_expanded['Timestamp_JST'].max().strftime("%Y-%m-%d %H:%M JST"),
+        f"{min_voltage:.2f}", f"{mean_voltage:.2f}", f"{max_dt:.1f}", str(missing_count),
+        abnormal_flag, severity, category, followup
+    ]
+    print("\n[AppendLog Data]:", log_row)
+
+if __name__ == "__main__":
+    main()
+```
+
+
+
+### 4. AppendLog 送信データ
+```json
+[
+  "2025-12-04 14:48 JST",
+  "02200EEC",
+  "",
+  "2025-11-15 00:00 JST",
+  "2025-12-04 12:38 JST",
+  "3.61",
+  "3.61",
+  "50.0",
+  "13",
+  "異常あり",
+  "高",
+  "通信欠測型",
+  "要対応"
+]
