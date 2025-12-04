@@ -1,0 +1,116 @@
+import pandas as pd
+import numpy as np
+import re
+from collections import Counter
+import hashlib
+import matplotlib.pyplot as plt
+
+TARGET_CSV = 'export-device-2200EEC-messages.csv'
+
+def file_hash(filepath):
+    """ファイルが実行ごとに異なっていないかチェック"""
+    with open(filepath, 'rb') as f:
+        return hashlib.md5(f.read()).hexdigest()
+
+def load_sigfox_csv(filepath):
+    parsed = []
+    irregular_lines = []
+    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+        for idx, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            parts = re.split(r'[;,]', line)
+            clean = [p.strip().replace('"', '').replace("'", "") for p in parts]
+            if len(clean) >= 4:
+                if 'Data' in clean[0] or 'Timestamp' in clean[-1]:
+                    continue
+                data_val = next((x for x in clean if re.match(r'^[0-9a-fA-F]{12,}$', x)), None)
+                time_val = next((x for x in clean if re.search(r'\d{4}-\d{2}-\d{2}', x)), None)
+                device_id = clean[1] if len(clean) > 1 else 'Unknown'
+                if data_val and time_val:
+                    parsed.append([data_val, device_id, time_val])
+                else:
+                    irregular_lines.append((idx, clean))
+            else:
+                irregular_lines.append((idx, clean))
+    return pd.DataFrame(parsed, columns=['Data','DeviceID','Timestamp']), irregular_lines
+
+def decode_payload(row):
+    s = re.sub(r'[^0-9a-fA-F]', '', row['Data'])
+    if len(s) < 24:
+        return None
+    try:
+        volt = (int(s[:2], 16) * 0.0125) + 1.0
+        values = [int(s[4+i*4:8+i*4], 16) for i in range(5)]
+        return volt, values
+    except Exception:
+        return None
+
+def analyze_once(filepath):
+    df_raw, irregular = load_sigfox_csv(filepath)
+    df_raw['Timestamp'] = pd.to_datetime(df_raw['Timestamp'], errors='coerce')
+    df_raw = df_raw.dropna().sort_values('Timestamp').reset_index(drop=True)
+
+    df_raw['TimeDiff_min'] = df_raw['Timestamp'].diff().dt.total_seconds() / 60
+    missing = (df_raw['TimeDiff_min'] > 11).sum()
+    long_gap = (df_raw['TimeDiff_min'] >= 60).sum()
+    max_gap = df_raw['TimeDiff_min'].max()
+    total = len(df_raw)
+
+    decoded = [decode_payload(r) for _, r in df_raw.iterrows()]
+    valid = [d for d in decoded if d is not None]
+    invalid = len(decoded) - len(valid)
+
+    if not valid:
+        return None
+
+    voltages = [v[0] for v in valid]
+    min_v = np.min(voltages)
+    mean_v = np.mean(voltages)
+    distances = np.concatenate([v[1] for v in valid])
+    deltas = -np.diff(distances)
+    abnormal = np.sum((deltas > 20) | (deltas < -20))
+
+    return {
+        'total_lines': len(df_raw),
+        'invalid_lines': invalid,
+        'irregular_lines': len(irregular),
+        'min_voltage_v': round(min_v,3),
+        'mean_voltage_v': round(mean_v,3),
+        'missing_count': int(missing),
+        'long_gap_count': int(long_gap),
+        'max_interval_min': round(max_gap,1),
+        'abnormal_dh_count': int(abnormal)
+    }
+
+def run_diagnostics(n_runs=5):
+    print("=== Sigfox CSV Variation Diagnostic ===")
+    print(f"Target File: {TARGET_CSV}")
+    print(f"MD5 Hash: {file_hash(TARGET_CSV)}\n")
+
+    results = []
+    for i in range(n_runs):
+        r = analyze_once(TARGET_CSV)
+        if r:
+            results.append(r)
+            print(f"Run {i+1}: {r}")
+        else:
+            print(f"Run {i+1}: ❌ Decode failed")
+
+    df = pd.DataFrame(results)
+    print("\n=== Summary (Standard Deviation Across Runs) ===")
+    print(df.std(numeric_only=True).to_string(float_format='%.3f'))
+
+    if not df.empty:
+        plt.figure(figsize=(10,5))
+        df[['min_voltage_v','mean_voltage_v','missing_count','abnormal_dh_count']].plot(marker='o')
+        plt.title("Run-to-Run Variation Diagnostic")
+        plt.ylabel("Value")
+        plt.xlabel("Run Index")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+
+if __name__ == "__main__":
+    run_diagnostics(5)
